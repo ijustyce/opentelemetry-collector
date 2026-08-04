@@ -47,8 +47,8 @@ type Done interface {
 
 type ConsumeFunc[T any] func(context.Context, T, Done)
 
-// Queue defines a producer-consumer exchange which can be backed by e.g. the memory-based ring buffer queue
-// (boundedMemoryQueue) or via a disk-based queue (persistentQueue)
+// Queue defines a producer-consumer exchange backed by an in-memory queue. When storage is configured,
+// queued data is persisted during shutdown and restored on the next start.
 // Experimental: This API is at the early stage of development and may change without backward compatibility
 // until https://github.com/open-telemetry/opentelemetry-collector/issues/8122 is resolved.
 type Queue[T any] interface {

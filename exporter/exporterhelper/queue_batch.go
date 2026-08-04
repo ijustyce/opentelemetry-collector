@@ -25,7 +25,7 @@ type QueueBatchConfig = queuebatch.Config
 // BatchConfig defines a configuration for batching requests based on a timeout and a minimum number of items.
 type BatchConfig = queuebatch.BatchConfig
 
-// QueueBatchEncoding defines the encoding to be used if persistent queue is configured.
+// QueueBatchEncoding defines the encoding used for shutdown persistence and startup recovery.
 // Duplicate definition with queuebatch.Encoding since aliasing generics is not supported by default.
 type QueueBatchEncoding[T any] interface {
 	// Marshal is a function that can marshal a request and its context into bytes.

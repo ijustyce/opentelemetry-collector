@@ -345,6 +345,53 @@ func TestPersistentQueue_Shutdown(t *testing.T) {
 	require.NoError(t, pq.Shutdown(context.Background()))
 }
 
+func TestPersistentQueueWritesRuntimeItemsOnlyOnShutdown(t *testing.T) {
+	client := newFakeBoundedStorageClient(1_000_000)
+	pq := createTestPersistentQueueWithClient(client)
+	initialStorageSize := client.GetSizeInBytes()
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+	require.Equal(t, initialStorageSize, client.GetSizeInBytes())
+
+	require.NoError(t, pq.Shutdown(context.Background()))
+	require.Greater(t, client.GetSizeInBytes(), initialStorageSize)
+
+	restored := createTestPersistentQueueWithClient(client)
+	require.NoError(t, restored.Offer(context.Background(), intRequest(30)))
+
+	for _, expected := range []intRequest{10, 20, 30} {
+		_, req, done, ok := restored.Read(context.Background())
+		require.True(t, ok)
+		require.Equal(t, expected, req)
+		done.OnDone(nil)
+	}
+	require.Zero(t, restored.Size())
+	require.NoError(t, restored.Shutdown(context.Background()))
+}
+
+func TestPersistentQueueShutdownUnblocksOffer(t *testing.T) {
+	set := newSettingsWithStorage(request.SizerTypeRequests, 1)
+	set.BlockOnOverflow = true
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.initClient(context.Background(), newFakeBoundedStorageClient(1_000_000))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
+
+	result := make(chan error, 1)
+	go func() {
+		result <- pq.Offer(context.Background(), intRequest(20))
+	}()
+
+	select {
+	case err := <-result:
+		require.Failf(t, "Offer returned before shutdown", "error: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	require.NoError(t, pq.Shutdown(context.Background()))
+	require.ErrorIs(t, <-result, errQueueIsStopped)
+}
+
 func TestPersistentQueue_ConsumersProducers(t *testing.T) {
 	cases := []struct {
 		numMessagesProduced int
@@ -390,7 +437,7 @@ func TestPersistentQueue_ConsumersProducers(t *testing.T) {
 				require.NoError(t, aq.Offer(context.Background(), intRequest(10)))
 			}
 
-			// Because the persistent queue is not draining after Shutdown, need to wait here for the drain.
+			// Wait for runtime consumption before shutting down the queue.
 			assert.Eventually(t, func() bool {
 				return c.numMessagesProduced == int(consumed.Load())
 			}, 5*time.Second, 10*time.Millisecond)
@@ -439,7 +486,7 @@ func TestPersistentBlockingQueue(t *testing.T) {
 				})
 			}
 			wg.Wait()
-			// Because the persistent queue is not draining after Shutdown, need to wait here for the drain.
+			// Wait for runtime consumption before shutting down the queue.
 			assert.Eventually(t, func() bool {
 				return int(consumed.Load()) == 1_000_000
 			}, 5*time.Second, 10*time.Millisecond)
@@ -556,12 +603,12 @@ func TestPersistentQueue_CorruptedData(t *testing.T) {
 		{
 			name:             "corrupted all items",
 			corruptAllData:   true,
-			desiredQueueSize: 2, // - the dispatched item which was corrupted.
+			desiredQueueSize: 3,
 		},
 		{
 			name:             "corrupted some items",
 			corruptSomeData:  true,
-			desiredQueueSize: 2, // - the dispatched item which was corrupted.
+			desiredQueueSize: 3,
 		},
 		{
 			name:               "corrupted metadata",
@@ -583,31 +630,28 @@ func TestPersistentQueue_CorruptedData(t *testing.T) {
 			ext := storagetest.NewMockStorageExtension(nil)
 			ps := createTestPersistentQueueWithRequestsSizer(t, ext, 1000)
 
-			// Put some items, make sure they are loaded and shutdown the storage...
+			// Put some items and flush the in-memory queue to storage.
 			for range 3 {
 				require.NoError(t, ps.Offer(context.Background(), intRequest(50)))
 			}
 			assert.Equal(t, int64(3), ps.Size())
-			require.True(t, consume(ps, func(context.Context, intRequest) error {
-				return experr.NewShutdownErr(nil)
-			}))
-			assert.Equal(t, int64(3), ps.Size())
+			require.NoError(t, ps.Shutdown(context.Background()))
 
-			// We can corrupt data (in several ways) and not worry since we return ShutdownErr client will not be touched.
+			client, err := ext.GetClient(context.Background(), component.KindExporter, component.ID{}, pipeline.SignalTraces.String())
+			require.NoError(t, err)
+
 			if c.corruptAllData || c.corruptSomeData {
-				require.NoError(t, ps.client.Set(context.Background(), "0", badBytes))
+				require.NoError(t, client.Set(context.Background(), "0", badBytes))
 			}
 			if c.corruptAllData {
-				require.NoError(t, ps.client.Set(context.Background(), "1", badBytes))
-				require.NoError(t, ps.client.Set(context.Background(), "2", badBytes))
+				require.NoError(t, client.Set(context.Background(), "1", badBytes))
+				require.NoError(t, client.Set(context.Background(), "2", badBytes))
 			}
 
 			if c.corruptMetadataKey {
-				require.NoError(t, ps.client.Set(context.Background(), metadataKey, badBytes))
+				require.NoError(t, client.Set(context.Background(), metadataKey, badBytes))
 			}
-
-			// Cannot close until we corrupt the data because the
-			require.NoError(t, ps.Shutdown(context.Background()))
+			require.NoError(t, client.Close(context.Background()))
 
 			// Reload
 			newPs := createTestPersistentQueueWithRequestsSizer(t, ext, 1000)
@@ -626,6 +670,8 @@ func TestPersistentQueue_CurrentlyProcessedItems(t *testing.T) {
 	for range 5 {
 		require.NoError(t, ps.Offer(context.Background(), req))
 	}
+	require.NoError(t, ps.Shutdown(context.Background()))
+	ps = createTestPersistentQueueWithRequestsSizer(t, ext, 1000)
 
 	requireCurrentlyDispatchedItemsEqual(t, ps, []uint64{})
 
@@ -765,12 +811,10 @@ func TestPersistentQueue_PutCloseReadClose(t *testing.T) {
 	ps := createTestPersistentQueueWithRequestsSizer(t, ext, 1000)
 	assert.Equal(t, int64(0), ps.Size())
 
-	// Put two elements and close the extension
+	// Put two elements and flush them to storage.
 	require.NoError(t, ps.Offer(context.Background(), req))
 	require.NoError(t, ps.Offer(context.Background(), req))
 	assert.Equal(t, int64(2), ps.Size())
-	// TODO: Remove this, after the initialization writes the readIndex.
-	_, _, _, _ = ps.Read(context.Background())
 	require.NoError(t, ps.Shutdown(context.Background()))
 
 	newPs := createTestPersistentQueueWithRequestsSizer(t, ext, 1000)
@@ -892,39 +936,16 @@ func TestPersistentQueue_StorageFull(t *testing.T) {
 
 	client := newFakeBoundedStorageClient(maxSizeInBytes)
 	ps := createTestPersistentQueueWithClient(client)
+	client.SetMaxSizeInBytes(client.GetSizeInBytes() + 1)
 
-	// Put enough items in to fill the underlying storage
-	reqCount := 0
-	for {
-		reqCount++
-		err = ps.Offer(context.Background(), intRequest(50))
-		if errors.Is(err, syscall.ENOSPC) {
-			break
-		}
-		require.NoError(t, err)
+	// Runtime offers use only memory, even if the configured storage cannot fit all requests.
+	for range 6 {
+		require.NoError(t, ps.Offer(context.Background(), intRequest(50)))
 	}
+	require.EqualValues(t, 6, ps.Size())
 
-	// Check that the size is correct
-	require.EqualValues(t, reqCount, ps.Size(), "Size must be equal to the number of items inserted")
-
-	// Manually set the storage to support writing the dispatch value.
-	client.SetMaxSizeInBytes(client.GetSizeInBytes() + 19)
-
-	// Take out all the items except last. Last one is there only in metadata because the data write failed.
-	for i := 0; i < reqCount-1; i++ {
-		require.True(t, consume(ps, func(_ context.Context, val intRequest) error {
-			require.Equal(t, intRequest(50), val)
-			return nil
-		}))
-	}
-	require.Equal(t, int64(1), ps.Size())
-	// Add one more element, and then read (drain) so metadata will be fixed.
-	require.NoError(t, ps.Offer(context.Background(), intRequest(50)))
-	require.True(t, consume(ps, func(_ context.Context, val intRequest) error {
-		require.Equal(t, intRequest(50), val)
-		return nil
-	}))
-	require.Equal(t, int64(0), ps.Size())
+	// Storage capacity is observed only while flushing the memory queue on shutdown.
+	require.ErrorIs(t, ps.Shutdown(context.Background()), syscall.ENOSPC)
 }
 
 func TestPersistentQueue_ItemDispatchingFinish_ErrorHandling(t *testing.T) {
@@ -1153,6 +1174,8 @@ func TestPersistentQueue_RestoredUsedSizeIsCorrectedOnDrain(t *testing.T) {
 		assert.True(t, consume(pq, func(context.Context, intRequest) error { return nil }))
 	}
 	assert.Equal(t, int64(30), pq.Size())
+	require.NoError(t, pq.Shutdown(context.Background()))
+	pq = createTestPersistentQueueWithItemsSizer(t, ext, 1000)
 
 	// Corrupt the size, in reality the size is 30.
 	// Once the queue is drained, it will be updated to the correct size.
