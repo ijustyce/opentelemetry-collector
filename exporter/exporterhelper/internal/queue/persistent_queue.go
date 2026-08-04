@@ -528,7 +528,10 @@ func (pq *persistentQueue[T]) onMemoryDone(item memoryPersistentItem, consumeErr
 }
 
 func (pq *persistentQueue[T]) persistMemoryItem(ctx context.Context, item memoryPersistentItem, dispatched bool) error {
-	if dispatched && pq.requestSize() != 0 {
+	// In-memory items are dispatched only after all unread recovery items have been consumed.
+	// Already persisted in-flight items do not prevent additional consumers from persisting
+	// their own items during the same shutdown.
+	if dispatched && pq.metadata.ReadIndex != pq.metadata.WriteIndex {
 		return errors.New("cannot persist an in-flight memory item while recovery storage is active")
 	}
 	pq.metadata.ItemsSize += item.itemsSize

@@ -745,6 +745,43 @@ func TestPersistentQueueStartWithNonDispatched(t *testing.T) {
 	require.Equal(t, int64(5), newPs.Size())
 }
 
+func TestPersistentQueueStartWithMultipleNonDispatched(t *testing.T) {
+	ext := storagetest.NewMockStorageExtension(nil)
+	ps := createTestPersistentQueueWithRequestsSizer(t, ext, 3)
+	requests := []intRequest{10, 20, 30}
+
+	for _, req := range requests {
+		require.NoError(t, ps.Offer(context.Background(), req))
+	}
+
+	dones := make([]Done, 0, len(requests))
+	for _, expected := range requests {
+		_, req, done, ok := ps.Read(context.Background())
+		require.True(t, ok)
+		require.Equal(t, expected, req)
+		dones = append(dones, done)
+	}
+
+	// Simulate multiple consumers returning after the retry sender has stopped but before
+	// persistentQueue.Shutdown marks the queue as stopped.
+	for _, done := range dones {
+		done.OnDone(experr.NewShutdownErr(nil))
+	}
+	requireCurrentlyDispatchedItemsEqual(t, ps, []uint64{0, 1, 2})
+	require.NoError(t, ps.Shutdown(context.Background()))
+
+	restored := createTestPersistentQueueWithRequestsSizer(t, ext, 3)
+	require.Equal(t, int64(len(requests)), restored.Size())
+	for _, expected := range requests {
+		require.True(t, consume(restored, func(_ context.Context, req intRequest) error {
+			require.Equal(t, expected, req)
+			return nil
+		}))
+	}
+	require.Zero(t, restored.Size())
+	require.NoError(t, restored.Shutdown(context.Background()))
+}
+
 func TestPersistentQueueStartWithNonDispatchedConcurrent(t *testing.T) {
 	req := intRequest(1)
 
