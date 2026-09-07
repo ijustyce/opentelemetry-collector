@@ -17,6 +17,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
@@ -262,6 +264,7 @@ func newSettingsWithStorage(sizerType request.SizerType, capacity int64) Setting
 
 func createTestPersistentQueueWithClient(client storage.Client) *persistentQueue[intRequest] {
 	pq := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeRequests, 1000)).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = 0
 	pq.initClient(context.Background(), client)
 	return pq
 }
@@ -277,7 +280,9 @@ func createTestPersistentQueueWithItemsSizer(tb testing.TB, ext storage.Extensio
 func createTestPersistentQueue(tb testing.TB, ext storage.Extension, sizerType request.SizerType, capacity int64) *persistentQueue[intRequest] {
 	pq := newPersistentQueue[intRequest](newSettingsWithStorage(sizerType, capacity))
 	require.NoError(tb, pq.Start(context.Background(), hosttest.NewHost(map[component.ID]component.Component{{}: ext})))
-	return pq.(*persistentQueue[intRequest])
+	persistentQueue := pq.(*persistentQueue[intRequest])
+	persistentQueue.shutdownTimeout = 0
+	return persistentQueue
 }
 
 func TestPersistentQueue_FullCapacity(t *testing.T) {
@@ -370,10 +375,86 @@ func TestPersistentQueueWritesRuntimeItemsOnlyOnShutdown(t *testing.T) {
 	require.NoError(t, restored.Shutdown(context.Background()))
 }
 
+func TestPersistentQueueShutdownDrainsMemoryItems(t *testing.T) {
+	client := newFakeBoundedStorageClient(1_000_000)
+	set := newSettingsWithStorage(request.SizerTypeRequests, 1000)
+	logs, observed := observer.New(zap.InfoLevel)
+	set.Telemetry.Logger = zap.New(logs)
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = time.Second
+	pq.initClient(context.Background(), client)
+	initialStorageSize := client.GetSizeInBytes()
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- pq.Shutdown(context.Background())
+	}()
+
+	assert.Eventually(t, func() bool {
+		return observed.FilterMessage("Persistent queue stopped accepting new requests and reading recovery storage; draining the in-memory queue").Len() == 1
+	}, time.Second, 10*time.Millisecond)
+	for _, expected := range []intRequest{10, 20} {
+		_, req, done, ok := pq.Read(context.Background())
+		require.True(t, ok)
+		require.Equal(t, expected, req)
+		done.OnDone(nil)
+	}
+	_, _, _, ok := pq.Read(context.Background())
+	require.False(t, ok)
+	require.NoError(t, <-shutdownDone)
+	require.Equal(t, initialStorageSize, client.GetSizeInBytes())
+	require.Equal(t, 1, observed.FilterMessage("Persistent queue shutdown is continuing because the in-memory queue was fully dispatched").Len())
+	require.Zero(t, observed.FilterMessage("Persisted remaining in-memory telemetry during shutdown").Len())
+}
+
+func TestPersistentQueueShutdownTimeoutFlushesMemoryItems(t *testing.T) {
+	client := newFakeBoundedStorageClient(1_000_000)
+	set := newSettingsWithStorage(request.SizerTypeRequests, 1000)
+	logs, observed := observer.New(zap.InfoLevel)
+	set.Telemetry.Logger = zap.New(logs)
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = 10 * time.Millisecond
+	pq.initClient(context.Background(), client)
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+	require.NoError(t, pq.Shutdown(context.Background()))
+
+	require.Equal(t, 1, observed.FilterMessage("Received persistent queue shutdown request").Len())
+	require.Equal(t, 1, observed.FilterMessage("Persistent queue shutdown is continuing because the drain timeout expired").Len())
+	flushLogs := observed.FilterMessage("Persisted remaining in-memory telemetry during shutdown").All()
+	require.Len(t, flushLogs, 1)
+	require.Equal(t, int64(2), flushLogs[0].ContextMap()["requests"])
+	require.Equal(t, int64(300), flushLogs[0].ContextMap()["flushedSize"])
+}
+
+func TestPersistentQueueShutdownLogsInFlightFlush(t *testing.T) {
+	client := newFakeBoundedStorageClient(1_000_000)
+	set := newSettingsWithStorage(request.SizerTypeRequests, 1000)
+	logs, observed := observer.New(zap.InfoLevel)
+	set.Telemetry.Logger = zap.New(logs)
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.initClient(context.Background(), client)
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+	_, _, done, ok := pq.Read(context.Background())
+	require.True(t, ok)
+	require.NoError(t, pq.Shutdown(context.Background()))
+	done.OnDone(experr.NewShutdownErr(errors.New("export interrupted")))
+
+	flushLogs := observed.FilterMessage("Persisted in-flight telemetry during shutdown").All()
+	require.Len(t, flushLogs, 1)
+	require.Equal(t, int64(1), flushLogs[0].ContextMap()["requests"])
+	require.Equal(t, int64(20), flushLogs[0].ContextMap()[zapNumberOfItems])
+}
+
 func TestPersistentQueueShutdownUnblocksOffer(t *testing.T) {
 	set := newSettingsWithStorage(request.SizerTypeRequests, 1)
 	set.BlockOnOverflow = true
 	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = 0
 	pq.initClient(context.Background(), newFakeBoundedStorageClient(1_000_000))
 	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
 
