@@ -32,8 +32,8 @@ type Config struct {
 	// If true, the component will wait for space; otherwise, operations will immediately return a retryable error.
 	BlockOnOverflow bool `mapstructure:"block_on_overflow"`
 
-	// StorageID if not empty, enables the persistent storage and uses the component specified
-	// as a storage extension for the persistent queue.
+	// StorageID if not empty, uses the component specified as a storage extension to persist
+	// the in-memory queue during shutdown and restore it on the next start.
 	// TODO: This will be changed to Optional when available.
 	// See https://github.com/open-telemetry/opentelemetry-collector/issues/13822
 	StorageID *component.ID `mapstructure:"storage"`
@@ -72,7 +72,6 @@ func (cfg *Config) Validate() error {
 		return errors.New("`queue_size` must be positive")
 	}
 
-	// Only support request sizer for persistent queue at this moment.
 	if cfg.StorageID != nil && cfg.WaitForResult {
 		return errors.New("`wait_for_result` is not supported with a persistent queue configured with `storage`")
 	}

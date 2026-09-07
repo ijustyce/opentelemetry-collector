@@ -30,7 +30,7 @@ The following configuration options can be modified:
   - `queue_size` (default = 1000): Maximum size the queue can accept. Measured in units defined by `sizer`
   - `batch`: see below.
 
-**Failure behavior**: If data cannot be added to the sending queue, it is typically dropped. This occurs when the queue has reached its configured capacity or, for persistent queues, when the underlying storage cannot accept additional data (for example, due to insufficient disk space or I/O errors).
+**Failure behavior**: If data cannot be added to the sending queue, it is typically dropped. This occurs when the queue has reached its configured capacity. When storage is configured, insufficient disk space or I/O errors can prevent the queue from being saved during shutdown.
 
 When `block_on_overflow` is enabled, the caller may instead wait until space becomes available, and the request may still be enqueued if capacity frees up before the timeout.
 
@@ -76,55 +76,22 @@ The `initial_interval`, `max_interval`, `max_elapsed_time`, and `timeout` option
 [duration strings](https://pkg.go.dev/time#ParseDuration),
 valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
-### Persistent Queue
+### Shutdown Persistence
 
-To use the persistent queue, the following setting needs to be set:
+To persist the queue during shutdown, the following setting needs to be set:
 
 - `sending_queue`
-  - `storage` (default = none): When set, enables persistence and uses the component specified as a storage extension for the persistent queue.
-    There is no in-memory queue when set.
+  - `storage` (default = none): When set, uses the specified storage extension for shutdown persistence and startup recovery.
+    The runtime queue remains in memory.
 
 The maximum number of batches stored to disk can be controlled using `sending_queue.queue_size` parameter (which,
 similarly as for in-memory buffering, defaults to 1000 batches).
 
-When persistent queue is enabled, the batches are being buffered using the provided storage extension - [filestorage] is a popular and safe choice. If the collector instance is killed while having some items in the persistent queue, on restart the items will be picked and the exporting is continued.
+When storage is configured, batches are buffered in memory during normal operation. During a graceful shutdown, queued batches are written to the provided storage extension; [filestorage] is a commonly used option. On the next start, stored batches are consumed before newly queued batches and are deleted after processing finishes.
 
-**Context Propagation**: Request context (including client metadata and span context) is preserved when using persistent queues. However, context set by Auth extensions is **not** propagated through the persistent queue. Auth extension context is ignored when data is persisted to disk, which means authentication/authorization information will not be available when the persisted data is processed.
+An abrupt process termination does not run the shutdown flush, so batches that only exist in memory are lost.
 
-```
-                                                              ┌─Consumer #1─┐
-                                                              │    ┌───┐    │
-                              ──────Deleted──────        ┌───►│    │ 1 │    ├───► Success
-        Waiting in channel    x           x     x        │    │    └───┘    │
-        for consumer ───┐     x           x     x        │    │             │
-                        │     x           x     x        │    └─────────────┘
-                        ▼     x           x     x        │
-┌─────────────────────────────────────────x─────x───┐    │    ┌─Consumer #2─┐
-│                             x           x     x   │    │    │    ┌───┐    │
-│     ┌───┐     ┌───┐ ┌───┐ ┌─x─┐ ┌───┐ ┌─x─┐ ┌─x─┐ │    │    │    │ 2 │    ├───► Permanent -> X
-│ n+1 │ n │ ... │ 6 │ │ 5 │ │ 4 │ │ 3 │ │ 2 │ │ 1 │ ├────┼───►│    └───┘    │      failure
-│     └───┘     └───┘ └───┘ └───┘ └───┘ └───┘ └───┘ │    │    │             │
-│                                                   │    │    └─────────────┘
-└───────────────────────────────────────────────────┘    │
-   ▲              ▲     ▲           ▲                    │    ┌─Consumer #3─┐
-   │              │     │           │                    │    │    ┌───┐    │
-   │              │     │           │                    │    │    │ 3 │    ├───► (in progress)
- write          read    └─────┬─────┘                    ├───►│    └───┘    │
- index          index         │                          │    │             │
-                              │                          │    └─────────────┘
-                              │                          │
-                          currently                      │    ┌─Consumer #4─┐
-                          dispatched                     │    │    ┌───┐    │     Temporary
-                                                         └───►│    │ 4 │    ├───►  failure
-                                                              │    └───┘    │         │
-                                                              │             │         │
-                                                              └─────────────┘         │
-                                                                     ▲                │
-                                                                     └── Retry ───────┤
-                                                                                      │
-                                                                                      │
-                                                   X  ◄────── Retry limit exceeded ───┘
-```
+**Context Propagation**: Request context (including client metadata and span context) is preserved in shutdown snapshots. However, context set by Auth extensions is not persisted, so authentication and authorization information is unavailable when restored data is processed.
 
 Example:
 

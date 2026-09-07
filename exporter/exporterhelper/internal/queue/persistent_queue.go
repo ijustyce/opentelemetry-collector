@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -26,6 +27,8 @@ const (
 	zapErrorCount    = "errorCount"
 	zapNumberOfItems = "numberOfItems"
 
+	persistentQueueShutdownTimeout = 3 * time.Minute
+
 	legacyReadIndexKey                = "ri"
 	legacyWriteIndexKey               = "wi"
 	legacyCurrentlyDispatchedItemsKey = "di"
@@ -39,6 +42,7 @@ var (
 	errInvalidValue       = errors.New("invalid value")
 	errNoStorageClient    = errors.New("no storage client extension found")
 	errWrongExtensionType = errors.New("requested extension is not a storage extension")
+	errQueueIsStopped     = errors.New("sending queue is stopped")
 )
 
 var indexDonePool = sync.Pool{
@@ -47,7 +51,8 @@ var indexDonePool = sync.Pool{
 	},
 }
 
-// persistentQueue provides a persistent queue implementation backed by file storage extension
+// persistentQueue keeps runtime requests in memory and uses a storage extension for shutdown snapshots
+// and startup recovery.
 //
 // Write index describes the position at which next item is going to be stored.
 // Read index describes which item needs to be read next.
@@ -86,14 +91,22 @@ type persistentQueue[T request.Request] struct {
 	mu              sync.Mutex
 	hasMoreElements *sync.Cond
 	hasMoreSpace    *cond
+	memoryItems     *linkedQueue[memoryPersistentItem]
+	memoryRequests  int64
+	memoryItemsSize int64
+	memoryBytesSize int64
 	metadata        PersistentMetadata
 	refClient       int64
+	stopping        bool
 	stopped         bool
+	drainCh         chan struct{}
+	shutdownTimeout time.Duration
 
 	blockOnOverflow bool
 }
 
-// newPersistentQueue creates a new queue backed by file storage; name and signal must be a unique combination that identifies the queue storage
+// newPersistentQueue creates a memory queue with shutdown persistence. The component ID and signal
+// must form a unique combination identifying its recovery storage.
 func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 	pq := &persistentQueue[T]{
 		logger:          set.Telemetry.Logger,
@@ -107,6 +120,8 @@ func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 		id:              set.ID,
 		signal:          set.Signal,
 		blockOnOverflow: set.BlockOnOverflow,
+		memoryItems:     &linkedQueue[memoryPersistentItem]{},
+		shutdownTimeout: persistentQueueShutdownTimeout,
 	}
 	pq.hasMoreElements = sync.NewCond(&pq.mu)
 	pq.hasMoreSpace = newCond(&pq.mu)
@@ -132,11 +147,11 @@ func (pq *persistentQueue[T]) Size() int64 {
 func (pq *persistentQueue[T]) internalSize() int64 {
 	switch pq.sizerType {
 	case request.SizerTypeBytes:
-		return pq.metadata.BytesSize
+		return pq.metadata.BytesSize + pq.memoryBytesSize
 	case request.SizerTypeItems:
-		return pq.metadata.ItemsSize
+		return pq.metadata.ItemsSize + pq.memoryItemsSize
 	default:
-		return pq.requestSize()
+		return pq.requestSize() + pq.memoryRequests
 	}
 }
 
@@ -248,12 +263,72 @@ func (pq *persistentQueue[T]) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
+	pq.logger.Info("Received persistent queue shutdown request")
+
+	pq.mu.Lock()
+	pq.stopping = true
+	pq.drainCh = make(chan struct{})
+	pq.hasMoreElements.Broadcast()
+	pq.hasMoreSpace.Broadcast()
+	pq.logger.Info("Persistent queue stopped accepting new requests and reading recovery storage; draining the in-memory queue",
+		zap.Duration("timeout", pq.shutdownTimeout))
+	initiallyDrained := !pq.memoryItems.hasElements()
+	if initiallyDrained {
+		close(pq.drainCh)
+	}
+	drainCh := pq.drainCh
+	pq.mu.Unlock()
+
+	drained := initiallyDrained
+	shutdownContextEnded := false
+	if !drained {
+		timer := time.NewTimer(pq.shutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-drainCh:
+			drained = true
+		case <-timer.C:
+		case <-ctx.Done():
+			shutdownContextEnded = true
+		}
+	}
+
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
-	// Mark this queue as stopped, so consumer don't start any more work.
 	pq.stopped = true
 	pq.hasMoreElements.Broadcast()
-	return pq.unrefClient(ctx)
+
+	switch {
+	case drained:
+		pq.logger.Info("Persistent queue shutdown is continuing because the in-memory queue was fully dispatched")
+	case shutdownContextEnded:
+		pq.logger.Info("Persistent queue shutdown is continuing because the shutdown context ended before the in-memory queue was fully dispatched",
+			zap.Error(ctx.Err()))
+	default:
+		pq.logger.Info("Persistent queue shutdown is continuing because the drain timeout expired")
+	}
+
+	var flushErr error
+	var flushedRequests, flushedSize int64
+	flushCtx := context.WithoutCancel(ctx)
+	for pq.memoryItems.hasElements() {
+		_, item, _ := pq.memoryItems.pop()
+		if err := pq.persistMemoryItem(flushCtx, item, false); err != nil {
+			flushErr = errors.Join(flushErr, err)
+		} else {
+			flushedRequests++
+			flushedSize += item.bytesSize
+		}
+		pq.removeMemoryItem(item)
+	}
+	if !drained || flushErr != nil {
+		pq.logger.Info("Persisted remaining in-memory telemetry during shutdown",
+			zap.Int64("requests", flushedRequests),
+			zap.Int64("flushedSize", flushedSize),
+			zap.Error(flushErr))
+	}
+
+	return errors.Join(flushErr, pq.unrefClient(flushCtx))
 }
 
 // unrefClient unrefs the client, and closes if no more references. Callers MUST hold the mutex.
@@ -270,11 +345,34 @@ func (pq *persistentQueue[T]) unrefClient(ctx context.Context) error {
 // without violating capacity restrictions. If success returns no error.
 // It returns ErrQueueIsFull if no space is currently available.
 func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
+	size := pq.activeSizer.Sizeof(req)
+	if size == 0 {
+		return nil
+	}
+	if size < 0 {
+		return errInvalidSize
+	}
+	if size > pq.capacity {
+		return errSizeTooLarge
+	}
+
+	reqBuf, err := pq.encoding.Marshal(ctx, req)
+	if err != nil {
+		return err
+	}
+	item := memoryPersistentItem{
+		buf:       reqBuf,
+		itemsSize: pq.itemsSizer.Sizeof(req),
+		bytesSize: pq.bytesSizer.Sizeof(req),
+	}
+
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
-	size := pq.activeSizer.Sizeof(req)
 	for pq.internalSize()+size > pq.capacity {
+		if pq.stopping {
+			return errQueueIsStopped
+		}
 		if !pq.blockOnOverflow {
 			return ErrQueueIsFull
 		}
@@ -282,30 +380,45 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 			return err
 		}
 	}
+	if pq.stopping {
+		return errQueueIsStopped
+	}
 
-	pq.metadata.ItemsSize += pq.itemsSizer.Sizeof(req)
-	pq.metadata.BytesSize += pq.bytesSizer.Sizeof(req)
-
-	return pq.putInternal(ctx, req)
+	pq.memoryItems.push(context.Background(), item, nil)
+	pq.memoryRequests++
+	pq.memoryItemsSize += item.itemsSize
+	pq.memoryBytesSize += item.bytesSize
+	pq.hasMoreElements.Signal()
+	return nil
 }
 
 // putInternal adds the request to the storage without updating items/bytes sizes.
 func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
+	reqBuf, err := pq.encoding.Marshal(ctx, req)
+	if err != nil {
+		return err
+	}
+	return pq.putEncodedInternal(ctx, reqBuf, false)
+}
+
+// putEncodedInternal adds an encoded request to storage. The caller must hold pq.mu.
+func (pq *persistentQueue[T]) putEncodedInternal(ctx context.Context, reqBuf []byte, dispatched bool) error {
+	index := pq.metadata.WriteIndex
 	pq.metadata.WriteIndex++
+	if dispatched {
+		pq.metadata.ReadIndex++
+		pq.metadata.CurrentlyDispatchedItems = append(pq.metadata.CurrentlyDispatchedItems, index)
+	}
 
 	metadataBuf, err := proto.Marshal(&pq.metadata)
 	if err != nil {
 		return err
 	}
 
-	reqBuf, err := pq.encoding.Marshal(ctx, req)
-	if err != nil {
-		return err
-	}
 	// Carry out a transaction where we both add the item and update the write index
 	ops := []*storage.Operation{
 		storage.SetOperation(metadataKey, metadataBuf),
-		storage.SetOperation(getItemKey(pq.metadata.WriteIndex-1), reqBuf),
+		storage.SetOperation(getItemKey(index), reqBuf),
 	}
 	if err := pq.client.Batch(ctx, ops...); err != nil {
 		// At this moment, metadata may be updated in the storage, so we cannot just revert changes to the
@@ -328,8 +441,9 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 			return context.Background(), req, nil, false
 		}
 
-		// Read until either a successful retrieved element or no more elements in the storage.
-		for pq.metadata.ReadIndex != pq.metadata.WriteIndex {
+		// Do not start new recovery-storage reads during shutdown. In-memory items are still
+		// dispatched during the grace period.
+		for !pq.stopping && pq.metadata.ReadIndex != pq.metadata.WriteIndex {
 			index, req, reqCtx, consumed := pq.getNextItem(ctx)
 			// Ensure the used size are in sync when queue is drained.
 			if pq.requestSize() == 0 {
@@ -343,6 +457,32 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 			}
 			// More space available, data was dropped.
 			pq.hasMoreSpace.Signal()
+		}
+
+		// Do not consume runtime data until every restored item has finished processing.
+		if !pq.stopping && len(pq.metadata.CurrentlyDispatchedItems) > 0 {
+			pq.hasMoreElements.Wait()
+			continue
+		}
+
+		if pq.memoryItems.hasElements() {
+			_, item, _ := pq.memoryItems.pop()
+			pq.signalDrainedIfNeeded()
+			restoredCtx, req, err := pq.encoding.Unmarshal(item.buf)
+			if err != nil {
+				pq.logger.Debug("Failed to decode in-memory item", zap.Error(err))
+				pq.removeMemoryItem(item)
+				pq.hasMoreSpace.Signal()
+				continue
+			}
+
+			pq.refClient++
+			return restoredCtx, req, &memoryDone{item: item, queue: pq}, true
+		}
+		if pq.stopping {
+			pq.signalDrainedIfNeeded()
+			var req T
+			return context.Background(), req, nil, false
 		}
 
 		// TODO: Need to change the Queue interface to return an error to allow distinguish between shutdown and context canceled.
@@ -423,6 +563,68 @@ func (pq *persistentQueue[T]) onDone(index uint64, itemsSize, bytesSize int64, c
 
 	// More space available after data are removed from the storage.
 	pq.hasMoreSpace.Signal()
+	if pq.requestSize() == 0 {
+		pq.hasMoreElements.Broadcast()
+	}
+}
+
+func (pq *persistentQueue[T]) onMemoryDone(item memoryPersistentItem, consumeErr error) {
+	pq.mu.Lock()
+	defer func() {
+		if err := pq.unrefClient(context.Background()); err != nil {
+			pq.logger.Error("Error closing the storage client", zap.Error(err))
+		}
+		pq.mu.Unlock()
+	}()
+
+	if experr.IsShutdownErr(consumeErr) {
+		// Items interrupted during shutdown are persisted as unread so they are picked up
+		// again after restart.
+		dispatched := !pq.stopping
+		if err := pq.persistMemoryItem(context.Background(), item, dispatched); err != nil {
+			pq.logger.Error("Error persisting in-memory item during shutdown", zap.Error(err))
+		} else {
+			pq.logger.Info("Persisted in-flight telemetry during shutdown",
+				zap.Int64("requests", 1),
+				zap.Int64(zapNumberOfItems, item.itemsSize))
+		}
+	}
+	pq.removeMemoryItem(item)
+	pq.signalDrainedIfNeeded()
+	pq.hasMoreSpace.Signal()
+}
+
+// signalDrainedIfNeeded notifies Shutdown once all requests that were still linked in memory
+// have been handed to consumers. The caller must hold pq.mu.
+func (pq *persistentQueue[T]) signalDrainedIfNeeded() {
+	if pq.stopping && pq.drainCh != nil && !pq.memoryItems.hasElements() {
+		select {
+		case <-pq.drainCh:
+		default:
+			close(pq.drainCh)
+		}
+	}
+}
+
+func (pq *persistentQueue[T]) persistMemoryItem(ctx context.Context, item memoryPersistentItem, dispatched bool) error {
+	// In-memory items are dispatched only after all unread recovery items have been consumed.
+	// Already persisted in-flight items do not prevent additional consumers from persisting
+	// their own items during the same shutdown.
+	if dispatched && pq.metadata.ReadIndex != pq.metadata.WriteIndex {
+		return errors.New("cannot persist an in-flight memory item while recovery storage is active")
+	}
+	pq.metadata.ItemsSize += item.itemsSize
+	pq.metadata.BytesSize += item.bytesSize
+	if err := pq.putEncodedInternal(ctx, item.buf, dispatched); err != nil {
+		return fmt.Errorf("failed persisting in-memory item: %w", err)
+	}
+	return nil
+}
+
+func (pq *persistentQueue[T]) removeMemoryItem(item memoryPersistentItem) {
+	pq.memoryRequests--
+	pq.memoryItemsSize -= item.itemsSize
+	pq.memoryBytesSize -= item.bytesSize
 }
 
 // retrieveAndEnqueueNotDispatchedReqs gets the items for which sending was not finished, cleans the storage
@@ -624,4 +826,21 @@ func (id *indexDone) reset(index uint64, itemsSize, bytesSize int64, queue inter
 
 func (id *indexDone) OnDone(err error) {
 	id.queue.onDone(id.index, id.itemsSize, id.bytesSize, err)
+}
+
+type memoryPersistentItem struct {
+	buf       []byte
+	itemsSize int64
+	bytesSize int64
+}
+
+type memoryDone struct {
+	item  memoryPersistentItem
+	queue interface {
+		onMemoryDone(memoryPersistentItem, error)
+	}
+}
+
+func (md *memoryDone) OnDone(err error) {
+	md.queue.onMemoryDone(md.item, err)
 }
