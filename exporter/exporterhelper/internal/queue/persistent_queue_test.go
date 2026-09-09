@@ -395,17 +395,24 @@ func TestPersistentQueueShutdownDrainsMemoryItems(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return observed.FilterMessage("Persistent queue stopped accepting new requests and reading recovery storage; draining the in-memory queue").Len() == 1
 	}, time.Second, 10*time.Millisecond)
-	for _, expected := range []intRequest{10, 20} {
+	for i, expected := range []intRequest{10, 20} {
 		_, req, done, ok := pq.Read(context.Background())
 		require.True(t, ok)
 		require.Equal(t, expected, req)
+		if i == 1 {
+			select {
+			case err := <-shutdownDone:
+				require.Failf(t, "Shutdown returned before the final request completed", "error: %v", err)
+			default:
+			}
+		}
 		done.OnDone(nil)
 	}
 	_, _, _, ok := pq.Read(context.Background())
 	require.False(t, ok)
 	require.NoError(t, <-shutdownDone)
 	require.Equal(t, initialStorageSize, client.GetSizeInBytes())
-	require.Equal(t, 1, observed.FilterMessage("Persistent queue shutdown is continuing because the in-memory queue was fully dispatched").Len())
+	require.Equal(t, 1, observed.FilterMessage("Persistent queue shutdown is continuing because all in-memory requests completed").Len())
 	require.Zero(t, observed.FilterMessage("Persisted remaining in-memory telemetry during shutdown").Len())
 }
 
@@ -430,12 +437,42 @@ func TestPersistentQueueShutdownTimeoutFlushesMemoryItems(t *testing.T) {
 	require.Equal(t, int64(300), flushLogs[0].ContextMap()["flushedSize"])
 }
 
+func TestPersistentQueueShutdownTimeoutStopsAndPersistsInFlightItem(t *testing.T) {
+	client := newFakeBoundedStorageClient(1_000_000)
+	expired := make(chan struct{})
+	set := newSettingsWithStorage(request.SizerTypeRequests, 1000)
+	set.OnShutdownExpired = func() {
+		close(expired)
+	}
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = 10 * time.Millisecond
+	pq.initClient(context.Background(), client)
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(10)))
+	_, _, done, ok := pq.Read(context.Background())
+	require.True(t, ok)
+	inFlightDone := make(chan struct{})
+	go func() {
+		<-expired
+		done.OnDone(experr.NewShutdownErr(errors.New("shutdown grace period expired")))
+		close(inFlightDone)
+	}()
+
+	require.NoError(t, pq.Shutdown(context.Background()))
+	<-inFlightDone
+
+	restored := createTestPersistentQueueWithClient(client)
+	require.Equal(t, int64(1), restored.Size())
+	require.NoError(t, restored.Shutdown(context.Background()))
+}
+
 func TestPersistentQueueShutdownLogsInFlightFlush(t *testing.T) {
 	client := newFakeBoundedStorageClient(1_000_000)
 	set := newSettingsWithStorage(request.SizerTypeRequests, 1000)
 	logs, observed := observer.New(zap.InfoLevel)
 	set.Telemetry.Logger = zap.New(logs)
 	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.shutdownTimeout = 0
 	pq.initClient(context.Background(), client)
 
 	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))

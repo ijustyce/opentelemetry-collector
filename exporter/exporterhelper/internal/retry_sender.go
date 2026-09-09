@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
@@ -47,28 +48,41 @@ func NewThrottleRetry(err error, delay time.Duration) error {
 
 type retrySender struct {
 	component.StartFunc
-	cfg    configretry.BackOffConfig
-	stopCh chan struct{}
-	logger *zap.Logger
-	next   sender.Sender[request.Request]
+	cfg      configretry.BackOffConfig
+	stopCtx  context.Context
+	stopFunc context.CancelFunc
+	stopOnce sync.Once
+	logger   *zap.Logger
+	next     sender.Sender[request.Request]
 }
 
 func newRetrySender(config configretry.BackOffConfig, set exporter.Settings, next sender.Sender[request.Request]) *retrySender {
+	stopCtx, stopFunc := context.WithCancel(context.Background())
 	return &retrySender{
-		cfg:    config,
-		stopCh: make(chan struct{}),
-		logger: set.Logger,
-		next:   next,
+		cfg:      config,
+		stopCtx:  stopCtx,
+		stopFunc: stopFunc,
+		logger:   set.Logger,
+		next:     next,
 	}
 }
 
 func (rs *retrySender) Shutdown(context.Context) error {
-	close(rs.stopCh)
+	rs.stopOnce.Do(func() {
+		rs.stopFunc()
+	})
 	return nil
 }
 
 // Send implements the requestSender interface
 func (rs *retrySender) Send(ctx context.Context, req request.Request) error {
+	sendCtx, cancel := context.WithCancel(ctx)
+	stopCancel := context.AfterFunc(rs.stopCtx, cancel)
+	defer func() {
+		stopCancel()
+		cancel()
+	}()
+
 	// Do not use NewExponentialBackOff since it calls Reset and the code here must
 	// call Reset after changing the InitialInterval (this saves an unnecessary call to Now).
 	expBackoff := backoff.ExponentialBackOff{
@@ -84,13 +98,19 @@ func (rs *retrySender) Send(ctx context.Context, req request.Request) error {
 		maxElapsedTime = time.Now().Add(rs.cfg.MaxElapsedTime)
 	}
 	for {
+		if rs.stopCtx.Err() != nil {
+			return experr.NewShutdownErr(errors.New("retry sender is shutting down"))
+		}
 		span.AddEvent(
 			"Sending request.",
 			trace.WithAttributes(attribute.Int64("retry_num", retryNum)))
 
-		err := rs.next.Send(ctx, req)
+		err := rs.next.Send(sendCtx, req)
 		if err == nil {
 			return nil
+		}
+		if rs.stopCtx.Err() != nil {
+			return experr.NewShutdownErr(err)
 		}
 
 		// Immediately drop data on permanent errors.
@@ -139,9 +159,12 @@ func (rs *retrySender) Send(ctx context.Context, req request.Request) error {
 
 		// back-off, but get interrupted when shutting down or request is cancelled or timed out.
 		select {
-		case <-ctx.Done():
+		case <-sendCtx.Done():
+			if rs.stopCtx.Err() != nil {
+				return experr.NewShutdownErr(err)
+			}
 			return fmt.Errorf("request is cancelled or timed out: %w", err)
-		case <-rs.stopCh:
+		case <-rs.stopCtx.Done():
 			return experr.NewShutdownErr(err)
 		case <-time.After(backoffDelay):
 		}

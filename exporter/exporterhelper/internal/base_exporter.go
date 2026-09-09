@@ -89,8 +89,14 @@ func NewBaseExporter(set exporter.Settings, signal pipeline.Signal, pusher sende
 	}
 
 	if be.queueCfg.HasValue() {
+		queueBatchSettings := be.queueBatchSettings
+		if be.RetrySender != nil && be.queueCfg.Get().StorageID != nil {
+			queueBatchSettings.OnShutdownExpired = func() {
+				_ = be.RetrySender.Shutdown(context.Background())
+			}
+		}
 		qSet := queuebatch.AllSettings[request.Request]{
-			Settings:  be.queueBatchSettings,
+			Settings:  queueBatchSettings,
 			Signal:    signal,
 			ID:        set.ID,
 			Telemetry: set.TelemetrySettings,
@@ -134,15 +140,23 @@ func (be *BaseExporter) Start(ctx context.Context, host component.Host) error {
 
 func (be *BaseExporter) Shutdown(ctx context.Context) error {
 	var err error
+	persistentQueueEnabled := be.QueueSender != nil && be.queueCfg.HasValue() && be.queueCfg.Get().StorageID != nil
 
-	// First shutdown the retry sender, so the queue sender can flush the queue without retries.
-	if be.RetrySender != nil {
-		err = multierr.Append(err, be.RetrySender.Shutdown(ctx))
-	}
-
-	// Then shutdown the queue sender.
-	if be.QueueSender != nil {
+	// Keep retries active while a persistent queue drains. Its shutdown deadline stops the retry sender
+	// before persisting requests that could not be exported within the grace period.
+	if persistentQueueEnabled {
 		err = multierr.Append(err, be.QueueSender.Shutdown(ctx))
+		if be.RetrySender != nil {
+			err = multierr.Append(err, be.RetrySender.Shutdown(ctx))
+		}
+	} else {
+		// Non-persistent queues retain the existing shutdown behavior and only try each request once.
+		if be.RetrySender != nil {
+			err = multierr.Append(err, be.RetrySender.Shutdown(ctx))
+		}
+		if be.QueueSender != nil {
+			err = multierr.Append(err, be.QueueSender.Shutdown(ctx))
+		}
 	}
 
 	// Last shutdown the wrapped exporter itself.

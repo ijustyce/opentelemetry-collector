@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/experr"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/requesttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sender"
@@ -50,6 +51,25 @@ func TestRetrySenderSimpleRetry(t *testing.T) {
 	require.NoError(t, rs.Send(context.Background(), &requesttest.FakeRequest{Items: 2}))
 	assert.Equal(t, 2, sink.ItemsCount())
 	assert.Equal(t, 1, sink.RequestsCount())
+	require.NoError(t, rs.Shutdown(context.Background()))
+}
+
+func TestRetrySenderShutdownCancelsActiveSend(t *testing.T) {
+	rCfg := configretry.NewDefaultBackOffConfig()
+	started := make(chan struct{})
+	rs := newRetrySender(rCfg, exportertest.NewNopSettings(exportertest.NopType), sender.NewSender(func(ctx context.Context, _ request.Request) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+
+	result := make(chan error, 1)
+	go func() {
+		result <- rs.Send(context.Background(), &requesttest.FakeRequest{Items: 2})
+	}()
+	<-started
+	require.NoError(t, rs.Shutdown(context.Background()))
+	require.True(t, experr.IsShutdownErr(<-result))
 	require.NoError(t, rs.Shutdown(context.Background()))
 }
 

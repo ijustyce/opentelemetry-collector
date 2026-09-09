@@ -88,19 +88,20 @@ type persistentQueue[T request.Request] struct {
 	signal      pipeline.Signal
 
 	// mu guards everything declared below.
-	mu              sync.Mutex
-	hasMoreElements *sync.Cond
-	hasMoreSpace    *cond
-	memoryItems     *linkedQueue[memoryPersistentItem]
-	memoryRequests  int64
-	memoryItemsSize int64
-	memoryBytesSize int64
-	metadata        PersistentMetadata
-	refClient       int64
-	stopping        bool
-	stopped         bool
-	drainCh         chan struct{}
-	shutdownTimeout time.Duration
+	mu                sync.Mutex
+	hasMoreElements   *sync.Cond
+	hasMoreSpace      *cond
+	memoryItems       *linkedQueue[memoryPersistentItem]
+	memoryRequests    int64
+	memoryItemsSize   int64
+	memoryBytesSize   int64
+	metadata          PersistentMetadata
+	refClient         int64
+	stopping          bool
+	stopped           bool
+	drainCh           chan struct{}
+	shutdownTimeout   time.Duration
+	onShutdownExpired func()
 
 	blockOnOverflow bool
 }
@@ -109,19 +110,20 @@ type persistentQueue[T request.Request] struct {
 // must form a unique combination identifying its recovery storage.
 func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 	pq := &persistentQueue[T]{
-		logger:          set.Telemetry.Logger,
-		encoding:        set.Encoding,
-		capacity:        set.Capacity,
-		sizerType:       set.SizerType,
-		activeSizer:     request.NewSizer(set.SizerType),
-		itemsSizer:      request.NewItemsSizer(),
-		bytesSizer:      request.NewBytesSizer(),
-		storageID:       *set.StorageID,
-		id:              set.ID,
-		signal:          set.Signal,
-		blockOnOverflow: set.BlockOnOverflow,
-		memoryItems:     &linkedQueue[memoryPersistentItem]{},
-		shutdownTimeout: persistentQueueShutdownTimeout,
+		logger:            set.Telemetry.Logger,
+		encoding:          set.Encoding,
+		capacity:          set.Capacity,
+		sizerType:         set.SizerType,
+		activeSizer:       request.NewSizer(set.SizerType),
+		itemsSizer:        request.NewItemsSizer(),
+		bytesSizer:        request.NewBytesSizer(),
+		storageID:         *set.StorageID,
+		id:                set.ID,
+		signal:            set.Signal,
+		blockOnOverflow:   set.BlockOnOverflow,
+		memoryItems:       &linkedQueue[memoryPersistentItem]{},
+		shutdownTimeout:   persistentQueueShutdownTimeout,
+		onShutdownExpired: set.OnShutdownExpired,
 	}
 	pq.hasMoreElements = sync.NewCond(&pq.mu)
 	pq.hasMoreSpace = newCond(&pq.mu)
@@ -272,7 +274,7 @@ func (pq *persistentQueue[T]) Shutdown(ctx context.Context) error {
 	pq.hasMoreSpace.Broadcast()
 	pq.logger.Info("Persistent queue stopped accepting new requests and reading recovery storage; draining the in-memory queue",
 		zap.Duration("timeout", pq.shutdownTimeout))
-	initiallyDrained := !pq.memoryItems.hasElements()
+	initiallyDrained := pq.memoryRequests == 0
 	if initiallyDrained {
 		close(pq.drainCh)
 	}
@@ -292,6 +294,9 @@ func (pq *persistentQueue[T]) Shutdown(ctx context.Context) error {
 			shutdownContextEnded = true
 		}
 	}
+	if !drained && pq.onShutdownExpired != nil {
+		pq.onShutdownExpired()
+	}
 
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -300,7 +305,7 @@ func (pq *persistentQueue[T]) Shutdown(ctx context.Context) error {
 
 	switch {
 	case drained:
-		pq.logger.Info("Persistent queue shutdown is continuing because the in-memory queue was fully dispatched")
+		pq.logger.Info("Persistent queue shutdown is continuing because all in-memory requests completed")
 	case shutdownContextEnded:
 		pq.logger.Info("Persistent queue shutdown is continuing because the shutdown context ended before the in-memory queue was fully dispatched",
 			zap.Error(ctx.Err()))
@@ -467,7 +472,6 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 
 		if pq.memoryItems.hasElements() {
 			_, item, _ := pq.memoryItems.pop()
-			pq.signalDrainedIfNeeded()
 			restoredCtx, req, err := pq.encoding.Unmarshal(item.buf)
 			if err != nil {
 				pq.logger.Debug("Failed to decode in-memory item", zap.Error(err))
@@ -594,10 +598,10 @@ func (pq *persistentQueue[T]) onMemoryDone(item memoryPersistentItem, consumeErr
 	pq.hasMoreSpace.Signal()
 }
 
-// signalDrainedIfNeeded notifies Shutdown once all requests that were still linked in memory
-// have been handed to consumers. The caller must hold pq.mu.
+// signalDrainedIfNeeded notifies Shutdown once all in-memory requests have completed.
+// The caller must hold pq.mu.
 func (pq *persistentQueue[T]) signalDrainedIfNeeded() {
-	if pq.stopping && pq.drainCh != nil && !pq.memoryItems.hasElements() {
+	if pq.stopping && pq.drainCh != nil && pq.memoryRequests == 0 {
 		select {
 		case <-pq.drainCh:
 		default:

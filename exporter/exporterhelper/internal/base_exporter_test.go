@@ -6,7 +6,9 @@ package internal
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,9 +19,11 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/hosttest"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/requesttest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/storagetest"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/pipeline"
 )
@@ -42,6 +46,45 @@ func TestBaseExporterWithOptions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, be.Start(context.Background(), componenttest.NewNopHost()))
 	require.Equal(t, want, be.Shutdown(context.Background()))
+}
+
+func TestBaseExporterPersistentQueueRetriesDuringShutdown(t *testing.T) {
+	storageID := component.MustNewIDWithName("file_storage", "storage")
+	qCfg := NewDefaultQueueConfig()
+	qCfg.StorageID = &storageID
+	qCfg.NumConsumers = 1
+	qCfg.Batch = configoptional.None[queuebatch.BatchConfig]()
+	rCfg := configretry.NewDefaultBackOffConfig()
+	rCfg.InitialInterval = 200 * time.Millisecond
+	rCfg.RandomizationFactor = 0
+	rCfg.MaxElapsedTime = 0
+
+	var attempts atomic.Int64
+	firstAttempt := make(chan struct{})
+	be, err := NewBaseExporter(
+		exportertest.NewNopSettings(exportertest.NopType),
+		pipeline.SignalMetrics,
+		func(context.Context, request.Request) error {
+			if attempts.Add(1) == 1 {
+				close(firstAttempt)
+				return errors.New("log server is unavailable")
+			}
+			return nil
+		},
+		WithQueueBatchSettings(newFakeQueueBatch()),
+		WithRetry(rCfg),
+		WithQueue(configoptional.Some(qCfg)),
+	)
+	require.NoError(t, err)
+	host := hosttest.NewHost(map[component.ID]component.Component{
+		storageID: storagetest.NewMockStorageExtension(nil),
+	})
+	require.NoError(t, be.Start(context.Background(), host))
+	require.NoError(t, be.Send(context.Background(), &requesttest.FakeRequest{Items: 2}))
+	<-firstAttempt
+
+	require.NoError(t, be.Shutdown(context.Background()))
+	require.Equal(t, int64(2), attempts.Load())
 }
 
 func TestQueueOptionsWithRequestExporter(t *testing.T) {
