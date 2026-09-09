@@ -91,8 +91,9 @@ func (qs *QueueBatch) Start(ctx context.Context, host component.Host) error {
 
 // Shutdown is invoked during service shutdown.
 func (qs *QueueBatch) Shutdown(ctx context.Context) error {
-	// Stop the queue and batcher, this will drain the queue and will call the retry (which is stopped) that will only
-	// try once every request.
+	// Flush the batcher's current requests before waiting for the queue to drain. Requests consumed
+	// after this point are flushed immediately instead of waiting in a new current batch.
+	qs.batcher.StartDraining()
 	return errors.Join(qs.queue.Shutdown(ctx), qs.batcher.Shutdown(ctx))
 }
 

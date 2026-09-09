@@ -23,6 +23,8 @@ func (db *disabledBatcher[T]) Consume(ctx context.Context, req T, done queue.Don
 	done.OnDone(db.consumeFunc(ctx, req))
 }
 
+func (db *disabledBatcher[T]) StartDraining() {}
+
 func newDisabledBatcher[T any](consumeFunc sender.SendFunc[T]) Batcher[T] {
 	return &disabledBatcher[T]{consumeFunc: consumeFunc}
 }

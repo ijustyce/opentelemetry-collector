@@ -20,6 +20,7 @@ import (
 type Batcher[T any] interface {
 	component.Component
 	Consume(context.Context, T, queue.Done)
+	StartDraining()
 }
 
 type batcherSettings[T any] struct {

@@ -25,6 +25,7 @@ type multiBatcher struct {
 	partitions  *lru.LRU[string, *partitionBatcher]
 	logger      *zap.Logger
 	lock        sync.Mutex
+	draining    bool
 }
 
 func newMultiBatcher(
@@ -74,6 +75,9 @@ func (mb *multiBatcher) getPartition(ctx context.Context, req request.Request) *
 	newPB := newPartitionBatcher(mb.cfg, mb.sizer, mb.mergeCtx, mb.wp, mb.consumeFunc, mb.logger)
 	_ = mb.partitions.Add(key, newPB)
 	_ = newPB.Start(ctx, nil)
+	if mb.draining {
+		newPB.StartDraining()
+	}
 	return newPB
 }
 
@@ -84,6 +88,17 @@ func (mb *multiBatcher) Start(context.Context, component.Host) error {
 func (mb *multiBatcher) Consume(ctx context.Context, req request.Request, done queue.Done) {
 	shard := mb.getPartition(ctx, req)
 	shard.Consume(ctx, req, done)
+}
+
+func (mb *multiBatcher) StartDraining() {
+	mb.lock.Lock()
+	defer mb.lock.Unlock()
+	mb.draining = true
+	for _, key := range mb.partitions.Keys() {
+		if pb, ok := mb.partitions.Peek(key); ok {
+			pb.StartDraining()
+		}
+	}
 }
 
 // getActivePartitionsCount is test only method

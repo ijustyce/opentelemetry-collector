@@ -53,20 +53,18 @@ func TestBaseExporterPersistentQueueRetriesDuringShutdown(t *testing.T) {
 	qCfg := NewDefaultQueueConfig()
 	qCfg.StorageID = &storageID
 	qCfg.NumConsumers = 1
-	qCfg.Batch = configoptional.None[queuebatch.BatchConfig]()
+	qCfg.Batch.GetOrInsertDefault().FlushTimeout = time.Hour
 	rCfg := configretry.NewDefaultBackOffConfig()
 	rCfg.InitialInterval = 200 * time.Millisecond
 	rCfg.RandomizationFactor = 0
 	rCfg.MaxElapsedTime = 0
 
 	var attempts atomic.Int64
-	firstAttempt := make(chan struct{})
 	be, err := NewBaseExporter(
 		exportertest.NewNopSettings(exportertest.NopType),
 		pipeline.SignalMetrics,
 		func(context.Context, request.Request) error {
 			if attempts.Add(1) == 1 {
-				close(firstAttempt)
 				return errors.New("log server is unavailable")
 			}
 			return nil
@@ -81,10 +79,50 @@ func TestBaseExporterPersistentQueueRetriesDuringShutdown(t *testing.T) {
 	})
 	require.NoError(t, be.Start(context.Background(), host))
 	require.NoError(t, be.Send(context.Background(), &requesttest.FakeRequest{Items: 2}))
-	<-firstAttempt
 
-	require.NoError(t, be.Shutdown(context.Background()))
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, be.Shutdown(shutdownCtx))
 	require.Equal(t, int64(2), attempts.Load())
+}
+
+func TestBaseExporterPersistentQueueRetriesUntilShutdownDeadline(t *testing.T) {
+	storageID := component.MustNewIDWithName("file_storage", "storage")
+	qCfg := NewDefaultQueueConfig()
+	qCfg.StorageID = &storageID
+	qCfg.NumConsumers = 1
+	qCfg.Batch.GetOrInsertDefault().FlushTimeout = time.Hour
+	rCfg := configretry.NewDefaultBackOffConfig()
+	rCfg.InitialInterval = 10 * time.Millisecond
+	rCfg.RandomizationFactor = 0
+	rCfg.MaxInterval = 10 * time.Millisecond
+	rCfg.MaxElapsedTime = 0
+
+	var attempts atomic.Int64
+	be, err := NewBaseExporter(
+		exportertest.NewNopSettings(exportertest.NopType),
+		pipeline.SignalMetrics,
+		func(context.Context, request.Request) error {
+			attempts.Add(1)
+			return errors.New("log server is unavailable")
+		},
+		WithQueueBatchSettings(newFakeQueueBatch()),
+		WithRetry(rCfg),
+		WithQueue(configoptional.Some(qCfg)),
+	)
+	require.NoError(t, err)
+	host := hosttest.NewHost(map[component.ID]component.Component{
+		storageID: storagetest.NewMockStorageExtension(nil),
+	})
+	require.NoError(t, be.Start(context.Background(), host))
+	require.NoError(t, be.Send(context.Background(), &requesttest.FakeRequest{Items: 2}))
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	require.NoError(t, be.Shutdown(shutdownCtx))
+	require.Less(t, time.Since(start), time.Second)
+	require.GreaterOrEqual(t, attempts.Load(), int64(2))
 }
 
 func TestQueueOptionsWithRequestExporter(t *testing.T) {

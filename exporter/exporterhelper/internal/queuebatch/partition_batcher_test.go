@@ -91,6 +91,27 @@ func TestPartitionBatcher_NoSplit_MinThresholdZero_TimeoutDisabled(t *testing.T)
 	}
 }
 
+func TestPartitionBatcherStartDrainingFlushesCurrentAndFutureRequests(t *testing.T) {
+	cfg := BatchConfig{
+		FlushTimeout: 0,
+		Sizer:        request.SizerTypeItems,
+		MinSize:      100,
+	}
+	sink := requesttest.NewSink()
+	ba := newPartitionBatcher(cfg, request.NewItemsSizer(), nil, newWorkerPool(1), sink.Export, zap.NewNop())
+	require.NoError(t, ba.Start(context.Background(), componenttest.NewNopHost()))
+
+	done := newFakeDone()
+	ba.Consume(context.Background(), &requesttest.FakeRequest{Items: 3}, done)
+	ba.StartDraining()
+	ba.Consume(context.Background(), &requesttest.FakeRequest{Items: 4}, done)
+
+	assert.Eventually(t, func() bool {
+		return sink.ItemsCount() == 7 && done.success.Load() == 2
+	}, time.Second, 10*time.Millisecond)
+	require.NoError(t, ba.Shutdown(context.Background()))
+}
+
 func TestPartitionBatcher_NoSplit_TimeoutDisabled(t *testing.T) {
 	tests := []struct {
 		name       string

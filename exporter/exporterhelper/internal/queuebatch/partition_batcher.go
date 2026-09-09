@@ -35,6 +35,7 @@ type partitionBatcher struct {
 	stopWG         sync.WaitGroup
 	currentBatchMu sync.Mutex
 	currentBatch   *batch
+	draining       bool
 	timer          *time.Timer
 	shutdownCh     chan struct{}
 	logger         *zap.Logger
@@ -97,7 +98,7 @@ func (qb *partitionBatcher) Consume(ctx context.Context, req request.Request, do
 		// We have at least one result in the reqList. Last in the list may not have enough data to be flushed.
 		// Find if it has at least MinSize, and if it does then move that as the current batch.
 		lastReq := reqList[len(reqList)-1]
-		if qb.sizer.Sizeof(lastReq) < qb.cfg.MinSize {
+		if !qb.draining && qb.sizer.Sizeof(lastReq) < qb.cfg.MinSize {
 			// Do not flush the last item and add it to the current batch.
 			reqList = reqList[:len(reqList)-1]
 			qb.currentBatch = &batch{
@@ -171,7 +172,7 @@ func (qb *partitionBatcher) Consume(ctx context.Context, req request.Request, do
 	// If we still have results to process, then we need to check if the last result has enough data to flush, or we add it to the currentBatch.
 	if len(reqList) > 0 {
 		lastReq := reqList[len(reqList)-1]
-		if qb.sizer.Sizeof(lastReq) < qb.cfg.MinSize {
+		if !qb.draining && qb.sizer.Sizeof(lastReq) < qb.cfg.MinSize {
 			// Do not flush the last item and add it to the current batch.
 			reqList = reqList[:len(reqList)-1]
 			qb.currentBatch = &batch{
@@ -189,6 +190,21 @@ func (qb *partitionBatcher) Consume(ctx context.Context, req request.Request, do
 	}
 	for i := 0; i < len(reqList); i++ {
 		qb.flush(ctx, reqList[i], done)
+	}
+}
+
+// StartDraining prevents newly consumed requests from remaining in currentBatch and asynchronously
+// flushes the current batch. It must not block on an occupied worker slot because those workers may
+// be retrying until the persistent queue's shutdown deadline expires.
+func (qb *partitionBatcher) StartDraining() {
+	qb.currentBatchMu.Lock()
+	qb.draining = true
+	batchToFlush := qb.currentBatch
+	qb.currentBatch = nil
+	qb.currentBatchMu.Unlock()
+
+	if batchToFlush != nil {
+		qb.flushAsync(batchToFlush.ctx, batchToFlush.req, batchToFlush.done)
 	}
 }
 
@@ -242,6 +258,14 @@ func (qb *partitionBatcher) flushCurrentBatchIfNotEmpty() {
 func (qb *partitionBatcher) flush(ctx context.Context, req request.Request, done queue.Done) {
 	qb.stopWG.Add(1)
 	qb.wp.execute(func() {
+		defer qb.stopWG.Done()
+		done.OnDone(qb.consumeFunc(ctx, req))
+	})
+}
+
+func (qb *partitionBatcher) flushAsync(ctx context.Context, req request.Request, done queue.Done) {
+	qb.stopWG.Add(1)
+	go qb.wp.execute(func() {
 		defer qb.stopWG.Done()
 		done.OnDone(qb.consumeFunc(ctx, req))
 	})
