@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -912,6 +913,31 @@ func TestBatchLogProcessor_BatchSize(t *testing.T) {
 		}, metricdatatest.IgnoreTimestamp())
 
 	require.NoError(t, tel.Shutdown(context.Background()))
+}
+
+func TestBatchLogProcessor_BatchSizeBytes(t *testing.T) {
+	cfg := &Config{
+		Timeout:       time.Hour,
+		SendBatchSize: 1000,
+	}
+	sink := new(consumertest.LogsSink)
+
+	logs, err := NewFactory().CreateLogs(context.Background(), processortest.NewNopSettings(metadata.Type), cfg, sink)
+	require.NoError(t, err)
+	require.NoError(t, logs.Start(context.Background(), componenttest.NewNopHost()))
+
+	body := strings.Repeat("a", logsBatchSizeBytes/2)
+	for range 2 {
+		ld := plog.NewLogs()
+		ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetStr(body)
+		require.NoError(t, logs.ConsumeLogs(context.Background(), ld))
+	}
+
+	require.Eventually(t, func() bool {
+		return sink.LogRecordCount() == 2
+	}, time.Second, 10*time.Millisecond)
+	require.NoError(t, logs.Shutdown(context.Background()))
+	require.Len(t, sink.AllLogs(), 1)
 }
 
 func TestBatchLogsProcessor_Timeout(t *testing.T) {

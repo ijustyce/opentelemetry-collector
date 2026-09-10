@@ -30,6 +30,8 @@ import (
 // errTooManyBatchers is returned when the MetadataCardinalityLimit has been reached.
 var errTooManyBatchers = consumererror.NewPermanent(errors.New("too many batcher metadata-value combinations"))
 
+const logsBatchSizeBytes = 20 * 1024 * 1024
+
 // batch_processor is a component that accepts spans and metrics, places them
 // into batches and sends downstream.
 //
@@ -37,12 +39,14 @@ var errTooManyBatchers = consumererror.NewPermanent(errors.New("too many batcher
 //
 // Batches are sent out with any of the following conditions:
 // - batch size reaches cfg.SendBatchSize
+// - log batch OTLP encoding size reaches logsBatchSizeBytes
 // - cfg.Timeout is elapsed since the timestamp when the previous batch was sent out.
 type batchProcessor[T any] struct {
-	logger           *zap.Logger
-	timeout          time.Duration
-	sendBatchSize    int
-	sendBatchMaxSize int
+	logger             *zap.Logger
+	timeout            time.Duration
+	sendBatchSize      int
+	sendBatchMaxSize   int
+	sendBatchSizeBytes int
 
 	// batchFunc is a factory for new batch objects corresponding
 	// with the appropriate signal.
@@ -108,6 +112,9 @@ type batch[T any] interface {
 
 	// sizeBytes counts the OTLP encoding size of the batch
 	sizeBytes(item T) int
+
+	// currentSizeBytes returns the OTLP encoding size of the current batch.
+	currentSizeBytes() int
 }
 
 // newBatchProcessor returns a new batch processor component.
@@ -227,7 +234,9 @@ func (b *shard[T]) startLoop() {
 func (b *shard[T]) processItem(item T) {
 	b.batch.add(item)
 	sent := false
-	for b.batch.itemCount() > 0 && (!b.hasTimer() || b.batch.itemCount() >= b.processor.sendBatchSize) {
+	for b.batch.itemCount() > 0 && (!b.hasTimer() ||
+		b.batch.itemCount() >= b.processor.sendBatchSize ||
+		(b.processor.sendBatchSizeBytes > 0 && b.batch.currentSizeBytes() >= b.processor.sendBatchSizeBytes)) {
 		sent = true
 		b.sendItems(triggerBatchSize)
 	}
@@ -416,6 +425,7 @@ func newLogsBatchProcessor(set processor.Settings, next consumer.Logs, cfg *Conf
 	if err != nil {
 		return nil, err
 	}
+	bp.sendBatchSizeBytes = logsBatchSizeBytes
 	return &logsBatchProcessor{batchProcessor: bp}, nil
 }
 
@@ -450,6 +460,10 @@ func (bt *batchTraces) add(td ptrace.Traces) {
 
 func (bt *batchTraces) sizeBytes(td ptrace.Traces) int {
 	return bt.sizer.TracesSize(td)
+}
+
+func (bt *batchTraces) currentSizeBytes() int {
+	return bt.sizeBytes(bt.traceData)
 }
 
 func (bt *batchTraces) export(ctx context.Context, td ptrace.Traces) error {
@@ -491,6 +505,10 @@ func (bm *batchMetrics) sizeBytes(md pmetric.Metrics) int {
 	return bm.sizer.MetricsSize(md)
 }
 
+func (bm *batchMetrics) currentSizeBytes() int {
+	return bm.sizeBytes(bm.metricData)
+}
+
 func (bm *batchMetrics) export(ctx context.Context, md pmetric.Metrics) error {
 	return bm.nextConsumer.ConsumeMetrics(ctx, md)
 }
@@ -530,6 +548,7 @@ type batchLogs struct {
 	nextConsumer consumer.Logs
 	logData      plog.Logs
 	logCount     int
+	logDataSize  int
 	sizer        plog.Sizer
 }
 
@@ -539,6 +558,10 @@ func newBatchLogs(nextConsumer consumer.Logs) *batchLogs {
 
 func (bl *batchLogs) sizeBytes(ld plog.Logs) int {
 	return bl.sizer.LogsSize(ld)
+}
+
+func (bl *batchLogs) currentSizeBytes() int {
+	return bl.logDataSize
 }
 
 func (bl *batchLogs) export(ctx context.Context, ld plog.Logs) error {
@@ -552,12 +575,14 @@ func (bl *batchLogs) split(sendBatchMaxSize int) (int, plog.Logs) {
 	if sendBatchMaxSize > 0 && bl.logCount > sendBatchMaxSize {
 		ld = splitLogs(sendBatchMaxSize, bl.logData)
 		bl.logCount -= sendBatchMaxSize
+		bl.logDataSize = bl.sizeBytes(bl.logData)
 		sent = sendBatchMaxSize
 	} else {
 		ld = bl.logData
 		sent = bl.logCount
 		bl.logData = plog.NewLogs()
 		bl.logCount = 0
+		bl.logDataSize = 0
 	}
 	return sent, ld
 }
@@ -573,5 +598,6 @@ func (bl *batchLogs) add(ld plog.Logs) {
 		return
 	}
 	bl.logCount += newLogsCount
+	bl.logDataSize += bl.sizeBytes(ld)
 	ld.ResourceLogs().MoveAndAppendTo(bl.logData.ResourceLogs())
 }
