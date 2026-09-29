@@ -43,6 +43,7 @@ The following settings can be optionally configured:
 - `read_buffer_size` (default = 0): ReadBufferSize for HTTP client.
 - `write_buffer_size` (default = 512 * 1024): WriteBufferSize for HTTP client.
 - `encoding` (default = proto): The encoding to use for the messages (valid options: `proto`, `json`)
+- `fallback_client` (disabled by default): An independent HTTP client used after a primary client timeout. Its `endpoint` is a base URL with `/v1/traces`, `/v1/metrics`, `/v1/logs`, or `/v1development/profiles` appended. Primary signal endpoint overrides do not apply to this URL. If the fallback endpoint is empty, requests retain the primary URL. Configure fallback timeout, TLS, authentication, headers, and compression independently.
 - `retry_on_failure`:  see [Retry on Failure](../exporterhelper/README.md#retry-on-failure) for the full set of available options.
 - `sending_queue`: see [Sending Queue](../exporterhelper/README.md#sending-queue) for the full set of available options.
 
@@ -71,6 +72,25 @@ exporters:
     ...
     encoding: json
 ```
+
+To send to a backup destination after a timeout:
+
+```yaml
+exporters:
+  otlp_http:
+    endpoint: https://primary.example.com:4318
+    timeout: 10s
+    fallback_client:
+      endpoint: https://backup.example.com:4318
+      timeout: 30s
+      compression: gzip
+```
+
+After the first timeout, requests use the fallback client for one minute. The next
+request after the interval probes the primary client. Further probe timeouts use
+a two-minute interval. Only one probe runs at a time; other requests continue to
+use the fallback. A primary HTTP response resets this state. Non-timeout errors
+and canceled or expired request contexts do not trigger fallback.
 
 The full list of settings exposed for this exporter are documented [here](./config.go)
 with detailed sample configurations [here](./testdata/config.yaml).

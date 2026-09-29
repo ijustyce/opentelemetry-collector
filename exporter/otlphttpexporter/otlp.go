@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -36,16 +38,24 @@ import (
 
 type baseExporter struct {
 	// Input configuration.
-	config      *Config
-	client      *http.Client
-	tracesURL   string
-	metricsURL  string
-	logsURL     string
-	profilesURL string
-	logger      *zap.Logger
-	settings    component.TelemetrySettings
+	config         *Config
+	client         *http.Client
+	fallbackClient *http.Client
+	fallbackURL    *url.URL // 初始化时解析，发送期间只读。
+	tracesURL      string
+	metricsURL     string
+	logsURL        string
+	profilesURL    string
+	logger         *zap.Logger
+	settings       component.TelemetrySettings
 	// Default user-agent header.
 	userAgent string
+
+	clientMu         sync.RWMutex
+	fallbackDelay    time.Duration
+	fallbackUntil    time.Time
+	clientProbe      bool   // 是否已有默认 client 的恢复探测请求在途；由 clientMu 保护，确保同时最多只有一个探测请求。
+	clientGeneration uint64 // 客户端状态版本号；由 clientMu 保护，防止状态切换前发出的旧请求用返回结果覆盖新状态。
 }
 
 const (
@@ -59,6 +69,9 @@ const (
 // Create new exporter.
 func newExporter(cfg component.Config, set exporter.Settings) (*baseExporter, error) {
 	oCfg := cfg.(*Config)
+	if err := oCfg.validateFallback(); err != nil {
+		return nil, err
+	}
 
 	if oCfg.ClientConfig.Endpoint != "" {
 		_, err := url.Parse(oCfg.ClientConfig.Endpoint)
@@ -87,6 +100,14 @@ func (e *baseExporter) start(ctx context.Context, host component.Host) error {
 		return err
 	}
 	e.client = client
+
+	if e.config.FallbackClient != nil {
+		fallbackClient, err := e.config.FallbackClient.ToClient(ctx, host.GetExtensions(), e.settings)
+		if err != nil {
+			return fmt.Errorf("failed to create fallback HTTP client: %w", err)
+		}
+		e.fallbackClient = fallbackClient
+	}
 	return nil
 }
 
@@ -173,11 +194,10 @@ func (e *baseExporter) pushProfiles(ctx context.Context, td pprofile.Profiles) e
 	return e.export(ctx, e.profilesURL, request, e.profilesPartialSuccessHandler)
 }
 
-func (e *baseExporter) export(ctx context.Context, url string, request []byte, partialSuccessHandler partialSuccessHandler) error {
-	e.logger.Debug("Preparing to make HTTP request", zap.String("url", url))
+func (e *baseExporter) newRequest(ctx context.Context, url string, request []byte) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(request))
 	if err != nil {
-		return consumererror.NewPermanent(err)
+		return nil, consumererror.NewPermanent(err)
 	}
 
 	switch e.config.Encoding {
@@ -186,12 +206,21 @@ func (e *baseExporter) export(ctx context.Context, url string, request []byte, p
 	case EncodingProto:
 		req.Header.Set("Content-Type", protobufContentType)
 	default:
-		return fmt.Errorf("invalid encoding: %s", e.config.Encoding)
+		return nil, fmt.Errorf("invalid encoding: %s", e.config.Encoding)
 	}
 
 	req.Header.Set("User-Agent", e.userAgent)
+	return req, nil
+}
 
-	resp, err := e.client.Do(req)
+func (e *baseExporter) export(ctx context.Context, url string, request []byte, partialSuccessHandler partialSuccessHandler) error {
+	e.logger.Debug("Preparing to make HTTP request", zap.String("url", url))
+	req, err := e.newRequest(ctx, url, request)
+	if err != nil {
+		return err
+	}
+
+	resp, err := e.doRequest(req, url, request)
 	if err != nil {
 		return fmt.Errorf("failed to make an HTTP request: %w", err)
 	}
@@ -207,6 +236,9 @@ func (e *baseExporter) export(ctx context.Context, url string, request []byte, p
 	}
 
 	respStatus := readResponseStatus(resp)
+	if resp.Request != nil {
+		url = resp.Request.URL.String()
+	}
 
 	// Format the error message. Use the status if it is present in the response.
 	var errString string
@@ -249,6 +281,101 @@ func (e *baseExporter) export(ctx context.Context, url string, request []byte, p
 		}
 	}
 	return formattedErr
+}
+
+// doRequest 发送 HTTP 请求，并在默认 client 超时且请求 context 仍有效时，立即使用 fallbackClient 重发。
+// 首次超时后使用 fallbackClient 1 分钟；冷却期结束后的下一次发送会探测默认 client，
+// 若再次超时，则使用 fallbackClient 2 分钟，后续冷却期均保持 2 分钟。
+// 探测期间其他请求继续使用 fallbackClient；默认 client 收到 HTTP 响应后退出 fallback 状态并重置退避。
+// 探测发生非超时错误时保留当前冷却时长；上游 context 取消或到期时不触发切换或立即重发。
+// 并发请求共享受 clientMu 保护的状态，但网络 I/O 期间不持锁；未配置 fallbackClient 时直接使用默认 client。
+// 默认 client 直接发送 req；超时重发时根据备用 URL 和原始 request 新建请求，避免复制请求及复用被 transport 修改的 headers。
+func (e *baseExporter) doRequest(req *http.Request, url string, request []byte) (*http.Response, error) {
+	if e.fallbackClient == nil {
+		return e.client.Do(req)
+	}
+
+	e.clientMu.RLock()
+	generation := e.clientGeneration
+	useFallback := e.fallbackDelay > 0 && (time.Now().Before(e.fallbackUntil) || e.clientProbe)
+	probe := e.fallbackDelay > 0 && !useFallback
+	e.clientMu.RUnlock()
+	if useFallback {
+		return e.doFallbackRequest(req)
+	}
+
+	// 默认client 发生过超时，且已到探测时间，
+	if probe {
+		e.clientMu.Lock()
+		// 读锁释放后状态可能已变化，获取写锁后重新检查，避免并发发起多个探测。
+		if e.fallbackDelay > 0 && (time.Now().Before(e.fallbackUntil) || e.clientProbe) {
+			e.clientMu.Unlock()
+			return e.doFallbackRequest(req)
+		}
+		generation = e.clientGeneration
+		probe = e.fallbackDelay > 0
+		e.clientProbe = probe
+		e.clientMu.Unlock()
+	}
+
+	// 没有发生过超时，或需要探测
+	ctx := req.Context()
+	resp, err := e.client.Do(req)
+	var netErr net.Error
+	timedOut := errors.As(err, &netErr) && netErr.Timeout() && ctx.Err() == nil
+	if !timedOut && !probe {
+		return resp, err
+	}
+
+	e.clientMu.Lock()
+	// Ignore results from requests started before the last state transition.
+	if generation == e.clientGeneration {
+		e.clientProbe = false
+		switch {
+		case timedOut:
+			switch e.fallbackDelay {
+			case 0:
+				e.fallbackDelay = time.Minute
+			default:
+				e.fallbackDelay = 2 * time.Minute
+			}
+			e.fallbackUntil = time.Now().Add(e.fallbackDelay)
+			e.clientGeneration++
+			e.logger.Warn("Default HTTP client timed out; using fallback client",
+				zap.Duration("retry_after", e.fallbackDelay), zap.Error(err))
+		case err == nil && e.fallbackDelay > 0:
+			e.fallbackDelay = 0
+			e.fallbackUntil = time.Time{}
+			e.clientGeneration++
+			e.logger.Info("Default HTTP client responded; leaving fallback mode")
+		case err != nil && e.fallbackDelay > 0 && ctx.Err() == nil:
+			// A different probe error does not increase the timeout backoff.
+			e.fallbackUntil = time.Now().Add(e.fallbackDelay)
+			e.clientGeneration++
+		}
+	}
+	e.clientMu.Unlock()
+
+	if !timedOut {
+		return resp, err
+	}
+
+	fallbackReq, err := e.newRequest(ctx, url, request)
+	if err != nil {
+		return nil, err
+	}
+	return e.doFallbackRequest(fallbackReq)
+}
+
+// doFallbackRequest 处理尚未发送的请求，同时切换 URL 和 Host，避免沿用主服务地址。
+func (e *baseExporter) doFallbackRequest(req *http.Request) (*http.Response, error) {
+	if e.fallbackURL != nil {
+		// 每个请求持有独立的 URL 值，避免 transport 修改缓存或影响其他并发请求。
+		fallbackURL := *e.fallbackURL
+		req.URL = &fallbackURL
+		req.Host = fallbackURL.Host
+	}
+	return e.fallbackClient.Do(req)
 }
 
 // Determine if the status code is retryable according to the specification.

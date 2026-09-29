@@ -75,6 +75,19 @@ func composeSignalURL(oCfg *Config, signalOverrideURL, signalName, signalVersion
 	}
 }
 
+// composeFallbackSignalURL uses the fallback base independently of primary
+// signal overrides. An empty endpoint preserves transport-only fallback.
+func composeFallbackSignalURL(cfg *Config, signalName, signalVersion string) (*url.URL, error) {
+	if cfg.FallbackClient == nil || cfg.FallbackClient.Endpoint == "" {
+		return nil, nil
+	}
+	endpoint, err := url.Parse(cfg.FallbackClient.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return endpoint.JoinPath(signalVersion, signalName), nil
+}
+
 func createTraces(
 	ctx context.Context,
 	set exporter.Settings,
@@ -87,6 +100,10 @@ func createTraces(
 	oCfg := cfg.(*Config)
 
 	oce.tracesURL, err = composeSignalURL(oCfg, oCfg.TracesEndpoint, "traces", "v1")
+	if err != nil {
+		return nil, err
+	}
+	oce.fallbackURL, err = composeFallbackSignalURL(oCfg, "traces", "v1")
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +133,10 @@ func createMetrics(
 	if err != nil {
 		return nil, err
 	}
+	oce.fallbackURL, err = composeFallbackSignalURL(oCfg, "metrics", "v1")
+	if err != nil {
+		return nil, err
+	}
 
 	return exporterhelper.NewMetrics(ctx, set, cfg,
 		oce.pushMetrics,
@@ -138,6 +159,10 @@ func createLogs(
 	}
 	oCfg := cfg.(*Config)
 	oce.logsURL, err = composeSignalURL(oCfg, oCfg.LogsEndpoint, "logs", "v1")
+	if err != nil {
+		return nil, err
+	}
+	oce.fallbackURL, err = composeFallbackSignalURL(oCfg, "logs", "v1")
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +189,10 @@ func createProfiles(
 	oCfg := cfg.(*Config)
 
 	oce.profilesURL, err = composeSignalURL(oCfg, oCfg.ProfilesEndpoint, "profiles", "v1development")
+	if err != nil {
+		return nil, err
+	}
+	oce.fallbackURL, err = composeFallbackSignalURL(oCfg, "profiles", "v1development")
 	if err != nil {
 		return nil, err
 	}
